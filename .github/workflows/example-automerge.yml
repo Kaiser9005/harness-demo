@@ -1,0 +1,100 @@
+# example-automerge.yml — the THIN GLUE that wires the verdict core into CI.
+#
+# This is illustrative: it shows the shape of the integration without being tied to any one repo.
+# The DECISION lives in core/verdict_core.sh (which has 48 fixture assertions). This workflow only
+# does I/O: gather the PR's observed state via the API → pipe it to the core → act on the exit code.
+# The split is the whole point — the glue can only be integration-tested on a live PR, so the part
+# that decides whether an agent's PR merges unattended is kept pure and unit-testable.
+#
+# To use it for real you would: set the repo variable AUTOMERGE_KILL_SWITCH to the string "false"
+# (it ships OFF — gate 7), pin ORACLE_LOGIN to your oracle bot's login, and adjust the required
+# check names + guarded-path regex to your repo. Until AUTOMERGE_KILL_SWITCH == "false", every run
+# is a NOOP. That is deliberate: the gate is inert until a human explicitly arms it.
+
+name: agent-output auto-merge (example)
+
+on:
+  pull_request:
+    types: [labeled, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]          # re-fire when the oracle posts its verdict
+  workflow_dispatch:
+    inputs:
+      pr: { description: "PR number to re-evaluate", required: true }
+
+permissions:
+  contents: write             # to queue the merge
+  pull-requests: write        # to comment "human-merge required"
+  checks: read
+
+concurrency:
+  group: automerge-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gather PR state and call the verdict core
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOMERGE_KILL_SWITCH: ${{ vars.AUTOMERGE_KILL_SWITCH }}   # must be the string "false" to enable
+          ORACLE_LOGIN: ${{ vars.ORACLE_LOGIN }}                      # the oracle bot's authenticated login
+          SENTINEL_PRS: ${{ vars.AUTOMERGE_SENTINEL_PRS }}           # comma list of recorded false-passes
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+        run: |
+          set -euo pipefail
+
+          # 1) PR metadata
+          pr_json="$(gh pr view "$PR" --json number,isDraft,state,mergeable,headRefOid,labels,files,comments)"
+          head="$(jq -r '.headRefOid' <<<"$pr_json")"
+
+          # 2) required checks — per-named-check conclusion via the API (NOT mergeable_state alone)
+          checks_json="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head}/check-runs" \
+            --jq '[.check_runs[] | {name, conclusion}]')"
+          conc() { jq -r --arg n "$1" 'map(select(.name==$n)) | (.[0].conclusion // "missing")' <<<"$checks_json"; }
+
+          # 3) the adversarial verdict comment (your reviewer step posts a structured JSON marker)
+          verdict_json="$(jq -c '[.comments[].body] | map(capture("<!-- review-verdict -->\\s*```json\\s*(?<j>\\{[^`]*\\})\\s*```"; "s").j) | (.[-1] // "null") | fromjson? // null' <<<"$pr_json")"
+
+          # 4) the independent oracle — parsed by the SHARED core (author filter + diff_sha pin)
+          oracle_result="$(jq -c --arg head "$head" --arg login "${ORACLE_LOGIN:-}" \
+            '{head_sha:$head, oracle_login:$login, strict_sha:true, comments:[.comments[]|{author:{login:.author.login}, body:.body}]}' <<<"$pr_json" \
+            | bash core/oracle_core.sh)"
+          # map the core's RECORD/SKIP line → the enum the verdict core wants
+          case "$oracle_result" in
+            "RECORD"*" accept "*) oracle='{"result":"accept"}' ;;
+            "RECORD"*" reject "*) oracle='{"result":"reject"}' ;;
+            "SKIP no-verdict-marker"*|"SKIP stale-verdict"*) oracle='{"result":"await"}' ;;
+            *) oracle='{"result":"block"}' ;;   # any other SKIP = fail-closed
+          esac
+
+          # 5) assemble the state and call the DECISION core
+          state="$(jq -nc \
+            --arg kill "${AUTOMERGE_KILL_SWITCH:-}" \
+            --argjson is_ao "$(jq '[.labels[].name] | any(. == "agent-output")' <<<"$pr_json")" \
+            --argjson is_open "$(jq '.state == "OPEN"' <<<"$pr_json")" \
+            --argjson is_draft "$(jq '.isDraft' <<<"$pr_json")" \
+            --arg mstate "$(jq -r '.mergeable' <<<"$pr_json" | tr "[:upper:]" "[:lower:]")" \
+            --arg head "$head" \
+            --argjson pr "$PR" \
+            --arg lint "$(conc "lint")" --arg tests "$(conc "tests")" --arg sec "$(conc "security")" \
+            --argjson verdict "$verdict_json" \
+            --argjson oracle "$oracle" \
+            --argjson files "$(jq '[.files[].path]' <<<"$pr_json")" \
+            '{kill_switch:$kill, is_agent_output:$is_ao, is_open:$is_open, is_draft:$is_draft,
+              mergeable_state:$mstate, head_sha:$head, pr_number:$pr,
+              checks:{lint:$lint, tests:$tests, security:$sec},
+              verdict:$verdict, oracle:$oracle, changed_files:$files}')"
+
+          verdict="$(printf '%s' "$state" | bash core/verdict_core.sh)"; rc=$?
+          echo "verdict: $verdict (exit $rc)"
+
+          # 6) act on the exit-code contract: 0 MERGE / 1 BLOCK / 2 NOOP
+          case "$rc" in
+            0) gh pr merge "$PR" --squash --auto ;;
+            1) gh pr comment "$PR" --body "🔒 human-merge required — ${verdict#BLOCK }" ;;
+            2) echo "noop: ${verdict#NOOP }" ;;   # disabled or not a candidate — do nothing
+          esac
