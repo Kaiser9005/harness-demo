@@ -17,6 +17,8 @@ $ bash demo/run.sh        # watch the gates make decisions, narrated
 $ bash tests/run.sh       # 48 assertions prove the fail-closed behavior
 ```
 
+![the 9 gates deciding, narrated — bash demo/run.sh](assets/demo.svg)
+
 ---
 
 ## Why this is the hard part (and the interesting part)
